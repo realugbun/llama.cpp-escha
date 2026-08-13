@@ -380,6 +380,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_XIELU_BETA,            "xielu.beta"            },
     { LLM_KV_XIELU_EPS,             "xielu.eps"             },
 
+    // routed experts stay in the ESCHAM 2/3-bit code; present only in escha models
+    { LLM_KV_ESCHA_VERSION,         "%s.escha.version"      },
+
     // deprecated
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },
     { LLM_KV_TOKENIZER_SUFFIX_ID, "tokenizer.ggml.suffix_token_id" },
@@ -517,6 +520,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
+    { LLM_TENSOR_ESCHA_LUT,                              "escha_lut" },
+    { LLM_TENSOR_ESCHA_DEP_K2,                           "escha_dep_k2" },
+    { LLM_TENSOR_ESCHA_DEP_K3,                           "escha_dep_k3" },
     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
     { LLM_TENSOR_DEC_ATTN_NORM,                          "dec.blk.%d.attn_norm" },
     { LLM_TENSOR_DEC_ATTN_Q,                             "dec.blk.%d.attn_q" },
@@ -806,6 +812,10 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_FFN_GATE_CHEXPS,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
     {LLM_TENSOR_FFN_UP_CHEXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
     {LLM_TENSOR_FFN_EXP_PROBS_B,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    // codec tables are layer-independent, but must land wherever the escha op runs
+    {LLM_TENSOR_ESCHA_LUT,                  {LLM_TENSOR_LAYER_INPUT,     GGML_OP_ESCHA_MOE}},
+    {LLM_TENSOR_ESCHA_DEP_K2,               {LLM_TENSOR_LAYER_INPUT,     GGML_OP_ESCHA_MOE}},
+    {LLM_TENSOR_ESCHA_DEP_K3,               {LLM_TENSOR_LAYER_INPUT,     GGML_OP_ESCHA_MOE}},
     // altup / laurel (gemma 3n)
     {LLM_TENSOR_PER_LAYER_TOKEN_EMBD,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_PER_LAYER_MODEL_PROJ,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},

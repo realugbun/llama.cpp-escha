@@ -16,6 +16,12 @@ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
     // NextN/MTP (Qwen3.5/3.6): extra decoder block appended beyond the main stack
+    // routed experts stay in the escha 2/3-bit code when this is present
+    ml.get_key(LLM_KV_ESCHA_VERSION, escha_version, false);
+    if (escha_version != 0 && escha_version != 1) {
+        throw std::runtime_error(format("unsupported escha codec version %u", escha_version));
+    }
+
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_impl");
 
@@ -54,6 +60,33 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
+
+    if (escha_version != 0) {
+        escha_lut    = create_tensor(tn(LLM_TENSOR_ESCHA_LUT),    { 65536 },  0);
+        escha_dep_k2 = create_tensor(tn(LLM_TENSOR_ESCHA_DEP_K2), { 16, 256 }, TENSOR_NOT_REQUIRED);
+        escha_dep_k3 = create_tensor(tn(LLM_TENSOR_ESCHA_DEP_K3), { 16, 256 }, TENSOR_NOT_REQUIRED);
+    }
+
+    // the code tensor carries its own bit width in ne[0] (16*K), so read it rather than
+    // assuming gate/up are 2-bit and down is 3-bit
+    auto load_escha_exps = [&](llm_escha_exps & e, llm_tensor t, int il,
+                               int64_t ic, int64_t oc, int flags) {
+        const std::string cname = tn(t, "escha_code", il).str();
+
+        const auto * w = ml.get_weight(cname.c_str());
+        if (w == nullptr) {
+            throw std::runtime_error("escha model is missing " + cname);
+        }
+
+        const int64_t n_code = w->tensor->ne[0];
+        if (n_code != 32 && n_code != 48) {
+            throw std::runtime_error(format("%s: unsupported code width %d", cname.c_str(), (int) n_code));
+        }
+
+        e.code = create_tensor(tn(t, "escha_code", il), { n_code, oc/16, ic/16, n_expert }, flags);
+        e.rin  = create_tensor(tn(t, "escha_rin",  il), { ic, n_expert }, flags);
+        e.rout = create_tensor(tn(t, "escha_rout", il), { oc, n_expert }, flags);
+    };
 
     auto load_block_trunk = [&](int il, int flags) {
         auto & layer = layers[il];
@@ -97,8 +130,14 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        if (escha_version != 0) {
+            load_escha_exps(layer.ffn_gate_escha, LLM_TENSOR_FFN_GATE_EXPS, il, n_embd,   n_ff_exp, flags);
+            load_escha_exps(layer.ffn_up_escha,   LLM_TENSOR_FFN_UP_EXPS,   il, n_embd,   n_ff_exp, flags);
+            load_escha_exps(layer.ffn_down_escha, LLM_TENSOR_FFN_DOWN_EXPS, il, n_ff_exp, n_embd,   flags);
+        } else {
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+            create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        }
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
@@ -498,6 +537,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    llm_escha_moe escha;
+    if (model.escha_version != 0) {
+        escha.lut    = model.escha_lut;
+        escha.dep_k2 = model.escha_dep_k2;
+        escha.dep_k3 = model.escha_dep_k3;
+        escha.gate   = model.layers[il].ffn_gate_escha;
+        escha.up     = model.layers[il].ffn_up_escha;
+        escha.down   = model.layers[il].ffn_down_escha;
+    }
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -512,7 +561,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr,
+            escha.active() ? &escha : nullptr);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation

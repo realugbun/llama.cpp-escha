@@ -1553,6 +1553,21 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_escha_mm_id(
+   const llm_escha_moe & escha,
+  const llm_escha_exps & w,
+          ggml_tensor * cur,
+          ggml_tensor * ids) const {
+    // bit width is a property of the projection, not of the model: gate/up are K=2 and
+    // down is K=3, and each K has its own bit-dependency table
+    const int64_t K = w.code->ne[0]/16;
+    ggml_tensor * dep = K == 2 ? escha.dep_k2 : escha.dep_k3;
+    GGML_ASSERT(dep != nullptr && "escha_dep table missing for this bit width");
+
+    // loras cannot apply here: there is no dense weight to add a low-rank update to
+    return ggml_escha_moe(ctx0, w.code, w.rin, w.rout, escha.lut, dep, cur, ids);
+}
+
 ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * cur,
          ggml_tensor * mw,
@@ -1887,7 +1902,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+ const llm_escha_moe * escha) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1908,7 +1924,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        escha
     );
 }
 
@@ -1936,7 +1953,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+ const llm_escha_moe * escha) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2109,7 +2127,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = escha && escha->up.active()
+            ? build_escha_mm_id(*escha, escha->up, cur, selected_experts)
+            : build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2121,7 +2141,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up_biased", il);
         }
 
-        if (gate_exps) {
+        if (escha && escha->gate.active()) {
+            cur = build_escha_mm_id(*escha, escha->gate, cur, selected_experts);
+            cb(cur, "ffn_moe_gate", il);
+        } else if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
@@ -2138,11 +2161,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    const bool has_gate = gate_exps || gate_up_exps;
+    const bool has_gate = gate_exps || gate_up_exps || (escha && escha->gate.active());
 
     switch (type_op) {
         case LLM_FFN_SILU:
-            if (gate_exps) {
+            if (gate_exps || (escha && escha->gate.active())) {
                 if (il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
@@ -2211,7 +2234,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = escha && escha->down.active()
+        ? build_escha_mm_id(*escha, escha->down, cur, selected_experts)
+        : build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

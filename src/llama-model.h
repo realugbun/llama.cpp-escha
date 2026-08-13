@@ -329,6 +329,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_b     = nullptr;
     struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
 
+    // routed experts kept in the escha 2/3-bit code; replaces the *_exps weights above
+    llm_escha_exps ffn_gate_escha;
+    llm_escha_exps ffn_up_escha;
+    llm_escha_exps ffn_down_escha;
+
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
@@ -596,6 +601,13 @@ struct llama_model {
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
+
+    // escha codec tables, shared by every layer. non-zero version means the routed
+    // experts are stored as code and the dense *_exps tensors are absent
+    uint32_t escha_version = 0;
+    struct ggml_tensor * escha_lut    = nullptr;
+    struct ggml_tensor * escha_dep_k2 = nullptr;
+    struct ggml_tensor * escha_dep_k3 = nullptr;
 
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;

@@ -380,6 +380,8 @@ enum llm_kv {
     LLM_KV_XIELU_BETA,
     LLM_KV_XIELU_EPS,
 
+    LLM_KV_ESCHA_VERSION,
+
     // deprecated:
     LLM_KV_TOKENIZER_PREFIX_ID,
     LLM_KV_TOKENIZER_SUFFIX_ID,
@@ -553,6 +555,10 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_COMPRESSOR_NORM,
     LLM_TENSOR_ATTN_SUB_NORM,
     LLM_TENSOR_FFN_SUB_NORM,
+    // escha codec tables, shared by every layer (see ggml_escha_moe)
+    LLM_TENSOR_ESCHA_LUT,
+    LLM_TENSOR_ESCHA_DEP_K2,
+    LLM_TENSOR_ESCHA_DEP_K3,
     LLM_TENSOR_DEC_ATTN_NORM,
     LLM_TENSOR_DEC_ATTN_Q,
     LLM_TENSOR_DEC_ATTN_K,

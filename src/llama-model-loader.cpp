@@ -904,7 +904,7 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
 }
 
 // checks if the weight tensor can be used with the specified buffer type and device
-static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
+static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev, const char * suffix = nullptr) {
     GGML_ASSERT(w != nullptr);
 
     if (op == GGML_OP_NONE) {
@@ -912,7 +912,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     }
 
     ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead()*8,
+        /*.mem_size   =*/ ggml_tensor_overhead()*16,
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
@@ -943,6 +943,35 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
                 ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
                 op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
+            } break;
+        case GGML_OP_ESCHA_MOE:
+            {
+                // w has to appear in the probe, otherwise the candidate buffer type is never
+                // exercised and a repacking one silently wins -- which then refuses the op at
+                // graph time, after the weights are already loaded
+                GGML_ASSERT(suffix != nullptr);
+                const int64_t n_ids = hparams.n_expert_used;
+                GGML_ASSERT(n_ids > 0);
+
+                const bool is_code = strcmp(suffix, "escha_code") == 0;
+                const bool is_rin  = strcmp(suffix, "escha_rin")  == 0;
+                const bool is_rout = strcmp(suffix, "escha_rout") == 0;
+
+                // dimensions w does not pin down get a shape the op accepts
+                const int64_t n_code = is_code ? w->ne[0] : 32;
+                const int64_t E      = is_code ? w->ne[3] : (is_rin || is_rout ? w->ne[1] : (hparams.n_expert > 0 ? hparams.n_expert : 1));
+                const int64_t IC     = is_code ? w->ne[2]*16 : (is_rin  ? w->ne[0] : 2048);
+                const int64_t OC     = is_code ? w->ne[1]*16 : (is_rout ? w->ne[0] : 512);
+
+                ggml_tensor * code = is_code ? w : ggml_new_tensor_4d(ctx, GGML_TYPE_I16, n_code, OC/16, IC/16, E);
+                ggml_tensor * rin  = is_rin  ? w : ggml_new_tensor_2d(ctx, GGML_TYPE_F16, IC, E);
+                ggml_tensor * rout = is_rout ? w : ggml_new_tensor_2d(ctx, GGML_TYPE_F16, OC, E);
+                ggml_tensor * lut  = strcmp(suffix, "escha_lut") == 0 ? w : ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 65536);
+                ggml_tensor * dep  = strncmp(suffix, "escha_dep", 9) == 0 ? w : ggml_new_tensor_2d(ctx, GGML_TYPE_I16, 16, 256);
+
+                ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, IC, 1, 512);
+                ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids, 512);
+                op_tensor = ggml_escha_moe(ctx, code, rin, rout, lut, dep, b, ids);
             } break;
         case GGML_OP_ADD:
             {
@@ -1044,12 +1073,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
-static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list, const char * suffix = nullptr) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
-        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev, suffix)) {
             return cur_buft;
         }
     }
@@ -1125,9 +1154,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
-        // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
+        // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID;
+        // ".escha_*" sidecars replace the expert matmul entirely, so they follow the escha op
+        // rather than the MUL_MAT_ID declared for the exps they hang off
         ggml_op op;
-        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+        if (tn.suffix != nullptr && strncmp(tn.suffix, "escha_", 6) == 0) {
+            op = GGML_OP_ESCHA_MOE;
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
         } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
                 (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
@@ -1135,6 +1168,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         } else {
             op = info.op;
         }
+
+        // the escha probe needs to know which slot this tensor fills; the shared codec
+        // tables carry no suffix, so fall back to their bare name
+        const char * escha_role = op == GGML_OP_ESCHA_MOE
+            ? (tn.suffix ? tn.suffix : ggml_get_name(t_meta))
+            : nullptr;
 
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
@@ -1174,7 +1213,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu, escha_role);
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1195,7 +1234,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft = select_weight_buft(hparams, t_meta, op, buft_list, escha_role);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
