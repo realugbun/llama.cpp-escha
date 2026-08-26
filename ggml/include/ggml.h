@@ -575,6 +575,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_ESCHA_MOE,
+        GGML_OP_ESCHA_MUL_MAT,
 
         GGML_OP_UNARY,
 
@@ -2613,6 +2614,31 @@ extern "C" {
             struct ggml_tensor  * dep,
             struct ggml_tensor  * x,
             struct ggml_tensor  * ids);
+
+    // fused decode + matmul for a single Escha ESCHAM projection -- the dense sibling of
+    // ggml_escha_moe. same codec and same rotations, but there is no routing: every row of
+    // x goes through the one weight matrix, so there are no ids and no per-expert stride.
+    //
+    //   y = T128((T128(x * rin) @ decode(code))) * rout
+    //
+    // used by the dense escha checkpoints (Qwen3.8-27B-Escha-W2), where 400 projections --
+    // attention, linear attention and MLP alike -- are stored as code rather than weights.
+    //
+    //   code : [16*K, OC/16, IC/16]     i16, K = 2 or 3
+    //   rin  : [IC]                     f16
+    //   rout : [OC]                     f16
+    //   lut  : [65536]                  f16  trellis codebook, shared by all K
+    //   dep  : [16, 256]                i16  payload bit index per code bit
+    //   x    : [IC, n_tokens, n_batch]  f32
+    //   res  : [OC, n_tokens, n_batch]  f32
+    GGML_API struct ggml_tensor * ggml_escha_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * code,
+            struct ggml_tensor  * rin,
+            struct ggml_tensor  * rout,
+            struct ggml_tensor  * lut,
+            struct ggml_tensor  * dep,
+            struct ggml_tensor  * x);
 
     // DSA lightning indexer
     //

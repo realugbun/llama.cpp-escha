@@ -1568,6 +1568,38 @@ ggml_tensor * llm_graph_context::build_escha_mm_id(
     return ggml_escha_moe(ctx0, w.code, w.rin, w.rout, escha.lut, dep, cur, ids);
 }
 
+ggml_tensor * llm_graph_context::build_escha_mm(
+const llm_escha_tables & tab,
+  const llm_escha_exps & w,
+          ggml_tensor * cur) const {
+    // bit width is a property of the projection: the dense export uses K=3 for mlp.up and
+    // mlp.down and K=2 everywhere else, and each K has its own bit-dependency table
+    const int64_t K = w.code->ne[0]/16;
+    ggml_tensor * dep = K == 2 ? tab.dep_k2 : tab.dep_k3;
+    GGML_ASSERT(dep != nullptr && "escha_dep table missing for this bit width");
+
+    // loras cannot apply here: there is no dense weight to add a low-rank update to
+    ggml_tensor * out = ggml_escha_mul_mat(ctx0, w.code, w.rin, w.rout, tab.lut, dep, cur);
+
+    // Every coded projection ships an fp32 bias-correction vector, and the base model has
+    // none, so applying it looks obviously right. escha's own runtime does NOT apply it:
+    // "ignoring them is what reproduces the results published here" (model card, Format
+    // notes). Applying it is a measured wash on quality there (79.16 -> 79.15 commonsense),
+    // so we default to their behaviour and keep the tensors loaded, because matching the
+    // reference runtime is worth more than a change that is quality-neutral by their own
+    // measurement. Flip to 1 to A/B it against the oracle.
+#define ESCHA_APPLY_BIAS 0
+#if ESCHA_APPLY_BIAS
+    if (w.bias != nullptr) {
+        out = ggml_add(ctx0, out, w.bias);
+    }
+#else
+    GGML_UNUSED(w.bias);
+#endif
+
+    return out;
+}
+
 ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * cur,
          ggml_tensor * mw,

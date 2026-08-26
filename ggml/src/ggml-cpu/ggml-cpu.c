@@ -2064,6 +2064,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_escha_moe(params, tensor);
             } break;
+        case GGML_OP_ESCHA_MUL_MAT:
+            {
+                ggml_compute_forward_escha_mul_mat(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2261,6 +2265,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_ESCHA_MOE:
+        case GGML_OP_ESCHA_MUL_MAT:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -2994,6 +2999,7 @@ struct ggml_cplan ggml_graph_plan(
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_ESCHA_MOE:
+                case GGML_OP_ESCHA_MUL_MAT:
                     {
                         // rotated input, accumulator, and one decoded 16x16 tile
                         const int64_t IC = node->src[0]->ne[2]*16;

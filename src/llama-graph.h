@@ -19,13 +19,24 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 
-// one routed projection left in the escha 2/3-bit code; see ggml_escha_moe
+// one projection left in the escha 2/3-bit code; see ggml_escha_moe / ggml_escha_mul_mat.
+// serves both shapes: the MoE code is 4-D with a trailing expert dim and rin/rout are 2-D,
+// the dense code is 3-D with 1-D rotations. bias is dense-only -- the dense export carries a
+// quantization bias-correction term the unquantized model does not have.
 struct llm_escha_exps {
     struct ggml_tensor * code = nullptr;
     struct ggml_tensor * rin  = nullptr;
     struct ggml_tensor * rout = nullptr;
+    struct ggml_tensor * bias = nullptr;
 
     bool active() const { return code != nullptr; }
+};
+
+// the codec tables, shared by every layer and both op flavours
+struct llm_escha_tables {
+    struct ggml_tensor * lut    = nullptr;
+    struct ggml_tensor * dep_k2 = nullptr;
+    struct ggml_tensor * dep_k3 = nullptr;
 };
 
 // the escha side of one MoE block: the shared codec tables plus the three projections
@@ -1055,6 +1066,13 @@ struct llm_graph_context {
       const llm_escha_exps & w,
               ggml_tensor * cur,
               ggml_tensor * ids) const;
+
+    // dense matmul for a projection still in the escha code -- stands in for build_lora_mm.
+    // applies the bias-correction term too, so callers must not add it themselves.
+    ggml_tensor * build_escha_mm(
+    const llm_escha_tables & tab,
+      const llm_escha_exps & w,
+              ggml_tensor * cur) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

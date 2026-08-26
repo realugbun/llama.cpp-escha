@@ -329,10 +329,21 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_b     = nullptr;
     struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
 
-    // routed experts kept in the escha 2/3-bit code; replaces the *_exps weights above
+    // experts (MoE) or plain ffn projections (dense) kept in the escha 2/3-bit code;
+    // replaces the *_exps weights above, or ffn_{gate,up,down} for a dense escha model
     llm_escha_exps ffn_gate_escha;
     llm_escha_exps ffn_up_escha;
     llm_escha_exps ffn_down_escha;
+
+    // dense escha models keep attention and linear attention in the code too, so every
+    // projection in the block has a counterpart here (400 of them in Qwen3.8-27B-Escha-W2)
+    llm_escha_exps wq_escha;
+    llm_escha_exps wk_escha;
+    llm_escha_exps wv_escha;
+    llm_escha_exps wo_escha;
+    llm_escha_exps wqkv_escha;        // linear-attn in_proj_qkv
+    llm_escha_exps wqkv_gate_escha;   // linear-attn in_proj_z
+    llm_escha_exps ssm_out_escha;     // linear-attn out_proj
 
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;

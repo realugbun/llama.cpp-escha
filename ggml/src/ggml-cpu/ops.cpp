@@ -11379,6 +11379,89 @@ void ggml_compute_forward_escha_moe(
     }
 }
 
+// ggml_compute_forward_escha_mul_mat
+//
+// dense sibling of the above: one weight matrix, no ids, so a row is just a token.
+
+void ggml_compute_forward_escha_mul_mat(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * code = dst->src[0];
+    const ggml_tensor * rin  = dst->src[1];
+    const ggml_tensor * rout = dst->src[2];
+    const ggml_tensor * lut  = dst->src[3];
+    const ggml_tensor * dep  = dst->src[4];
+    const ggml_tensor * x    = dst->src[5];
+
+    const int64_t nct = code->ne[1];        // output tiles
+    const int64_t nit = code->ne[2];        // input tiles
+    const int64_t OC  = nct*16;
+    const int64_t IC  = nit*16;
+
+    const int64_t tile_stride = code->ne[0];    // 16*K int16 per tile
+
+    const int16_t     * code_d = (const int16_t *)     code->data;
+    const ggml_fp16_t * rin_d  = (const ggml_fp16_t *) rin->data;
+    const ggml_fp16_t * rout_d = (const ggml_fp16_t *) rout->data;
+    const int16_t     * dep_d  = (const int16_t *)     dep->data;
+
+    // see ggml_compute_forward_escha_moe -- kept as a src for forward compatibility
+    GGML_UNUSED(lut);
+
+    const int64_t nrows = x->ne[1]*x->ne[2];
+
+    const int64_t dr = (nrows + params->nth - 1)/params->nth;
+    const int64_t r0 = dr*params->ith;
+    const int64_t r1 = MIN(r0 + dr, nrows);
+
+    float * wdata = (float *) params->wdata + (IC + OC + 256)*params->ith;
+    float * u     = wdata;
+    float * acc   = u   + IC;
+    float * tile  = acc + OC;
+
+    for (int64_t ir = r0; ir < r1; ++ir) {
+        const int64_t i1 = ir % x->ne[1];
+        const int64_t i2 = ir / x->ne[1];
+
+        const float * xr = (const float *)((const char *) x->data + i1*x->nb[1] + i2*x->nb[2]);
+
+        for (int64_t i = 0; i < IC; ++i) {
+            u[i] = xr[i]*GGML_CPU_FP16_TO_FP32(rin_d[i]);
+        }
+        ggml_escha_hadamard_128(u, IC);
+
+        memset(acc, 0, OC*sizeof(float));
+
+        for (int64_t i = 0; i < nit; ++i) {
+            const float * ub = u + i*16;
+
+            for (int64_t j = 0; j < nct; ++j) {
+                ggml_escha_decode_tile((const uint8_t *)(code_d + (i*nct + j)*tile_stride), dep_d, tile);
+
+                float * ab = acc + j*16;
+                for (int r = 0; r < 16; ++r) {
+                    const float ur = ub[r];
+                    if (ur == 0.0f) {
+                        continue;
+                    }
+
+                    const float * tr = tile + r*16;
+                    for (int c = 0; c < 16; ++c) {
+                        ab[c] += ur*tr[c];
+                    }
+                }
+            }
+        }
+
+        ggml_escha_hadamard_128(acc, OC);
+
+        float * dr_ = (float *)((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2]);
+        for (int64_t c = 0; c < OC; ++c) {
+            dr_[c] = acc[c]*GGML_CPU_FP16_TO_FP32(rout_d[c]);
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

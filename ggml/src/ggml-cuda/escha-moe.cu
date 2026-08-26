@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "escha-moe.cuh"
 #include "mmid.cuh"
+#include "mma.cuh"
 
 // Fused decode + routed matmul for Escha ESCHAM experts.
 //
@@ -33,6 +34,30 @@
 #define ESCHA_MAX_W    24   // uint32 words per payload, 48 int16 at K=3
 #define ESCHA_TARGET  512   // block count we try to reach by slicing the reduction
 #define ESCHA_ROWS     16   // rows of one expert per block on the batched path
+// dense reuses every decoded weight across this many rows. the decode, not bandwidth, is
+// the limit (see the routed path's ablation), so this is the main prefill lever: 16 -> 64
+// took a perplexity pass from 47.2 s to 18.9 s. kept separate from ESCHA_ROWS so the routed
+// path stays exactly as measured.
+//
+// But acc[R] is per thread whatever the real row count is, so a big R costs occupancy at
+// batch 1 and cripples generation (R=64 measured 1.84 t/s). Generation gets its own small
+// instantiation instead -- the decode work per token is the same either way, so all that
+// matters there is filling the device.
+#define ESCHA_ROWS_DENSE      64
+#define ESCHA_ROWS_DENSE_GEN   1
+#define ESCHA_GEN_MAX_ROWS    16   // at or below this, use the generation instantiation
+#define ESCHA_GEN_TARGET_MUL   4
+// prefill tile for the register-tiled kernel. BM*BN = TM*TN*NT, so these four fix the
+// thread count too: NT = (BM/TM)*(BN/TN). BN stays 128 -- activation traffic is
+// rows*IC*(OC/BN), so a narrower BN buys reuse with global bandwidth, which is a losing trade.
+#define ESCHA_BM 128
+#define ESCHA_BN 128
+#define ESCHA_TM   8
+#define ESCHA_TN   8
+                                   //     prefill: at batch 1 there are only n_ocb blocks
+                                   //     before slicing (136 for the FFN), which leaves an
+                                   //     82-SM device idle. Swept 1/2/4/8/16/32 -- flat from
+                                   //     10.3 to 11.3 tok/s, 4 marginally best.
 
 // Escha codebook A, the one this checkpoint uses (its config leaves "codebook" unset,
 // which eschamoe.py defaults to cbA / codebook_id 1). It is computed, not stored -- the
@@ -40,9 +65,25 @@
 // from escham_reconstruct_kernel<1, K> and checked against all 65536 entries.
 // The fp16 add must stay in fp16 to match the table bit for bit.
 static __device__ __forceinline__ float escha_codebook(uint32_t idx) {
-    const uint32_t x = ((idx*0xcbac1fedu) & 0x8fff8fffu) ^ 0x3b603b60u;
-    return __half2float(__hadd(__ushort_as_half((unsigned short) x),
-                               __ushort_as_half((unsigned short) (x >> 16))));
+    // (x & 0x8fff8fff) ^ 0x3b603b60 is one 3-input logic op; spelling it as lop3 stops
+    // ptxas from splitting it across the two 16-bit lanes. immLut 0x6a = (a & b) ^ c.
+    uint32_t x = idx*0xcbac1fedu;
+    asm("lop3.b32 %0, %1, %2, %3, 0x6a;"
+        : "=r"(x) : "r"(x), "n"(0x8fff8fffu), "n"(0x3b603b60u));
+    __half2 h;
+    memcpy(&h, &x, sizeof(h));
+    return __half2float(__hadd(__low2half(h), __high2half(h)));
+}
+
+// as escha_codebook, but stopping at the half. The codebook's last operation is already
+// an fp16 add, so the fp16 weight is exact -- only the ACTIVATIONS lose precision below.
+static __device__ __forceinline__ half escha_codebook_h(uint32_t idx) {
+    uint32_t x = idx*0xcbac1fedu;
+    asm("lop3.b32 %0, %1, %2, %3, 0x6a;"
+        : "=r"(x) : "r"(x), "n"(0x8fff8fffu), "n"(0x3b603b60u));
+    __half2 h;
+    memcpy(&h, &x, sizeof(h));
+    return __hadd(__low2half(h), __high2half(h));
 }
 
 // in-place normalized Sylvester-Hadamard over each block of 128
@@ -453,4 +494,715 @@ void ggml_cuda_op_escha_moe(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     escha_finalize<<<dim3(n_rows, n_ocb), ESCHA_NT, 0, stream>>>(
         (const half *) rout->data, (const int32_t *) ids->data, p_buf.get(), (float *) dst->data,
         OC, n_ids, n_rows, n_slices, ids->nb[0], ids->nb[1], dst->nb[1], dst->nb[2]);
+}
+
+// ===========================================================================
+// dense escha (ggml_escha_mul_mat)
+//
+// Same codec and same rotations as the routed path above, minus the routing: one weight
+// matrix, every row goes through it. That removes the ids indirection, mm_ids_helper and
+// the work list -- a block owns R consecutive rows outright. The IC reduction is still
+// sliced across blocks, because at batch 1 a single row would otherwise leave the device
+// mostly idle.
+// ===========================================================================
+
+// u[row] = T128(x[row] * rin)
+//
+// Staged through shared memory in fixed chunks rather than all of IC at once: the dense
+// projections go up to IC = 17408 (mlp.down), and 17408 floats is 68 KB, well past the
+// 48 KB a block gets. The rotation is independent per 128-block, so any chunk that is a
+// multiple of 128 splits it exactly.
+#define ESCHA_ROT_CHUNK 2048   // 8 KB of shared memory
+
+static __global__ void escha_rotate_in_dense(
+        const half  * __restrict__ rin,
+        const float * __restrict__ x,
+        float       * __restrict__ u,
+        const int IC, const int ne1,
+        const int64_t nb_x1, const int64_t nb_x2) {
+    __shared__ float s_u[ESCHA_ROT_CHUNK];
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+
+    const float * x_row = (const float *)((const char *) x + (int64_t)(row % ne1)*nb_x1
+                                                           + (int64_t)(row / ne1)*nb_x2);
+    float * dst = u + (int64_t) row*IC;
+
+    for (int off = 0; off < IC; off += ESCHA_ROT_CHUNK) {
+        const int n = min(ESCHA_ROT_CHUNK, IC - off);
+
+        for (int i = tid; i < n; i += blockDim.x) {
+            s_u[i] = x_row[off + i]*__half2float(rin[off + i]);
+        }
+        __syncthreads();
+
+        escha_hadamard_128(s_u, n, tid, blockDim.x);
+
+        for (int i = tid; i < n; i += blockDim.x) {
+            dst[off + i] = s_u[i];
+        }
+        __syncthreads();
+    }
+}
+
+// escha's dep table is computable, so the dense kernel never reads it.
+//
+// The 16 bits that form a weight's codebook index are always 16 cyclically-consecutive
+// positions of a bit-stream over the tile payload, where the stream visits 32-bit word 0
+// first and then walks the words downwards (0, NW-1, NW-2, ...). Only the start position
+// varies, and it is affine in the tile row and column:
+//
+//   pi(r) = (r&1) | ((r>>3)&1)<<1 | ((r>>1)&3)<<3      // bit 2 is left free for c
+//   t     = pi(r) + 32*c + 4*(c>>3)
+//   s     = ((32-K) - K*t) mod 256K
+//
+// Verified exact against both shipped tables, all 4096 entries (dep3.py). This turns
+// 8 shared dep reads + 16 payload reads + ~48 bit ops per weight into two reads and a
+// funnel shift, and drops the 8 KB per-block dep table that made batch 1 setup-bound.
+__device__ __forceinline__ int escha_dep_pi(int r) {
+    return (r & 1) | (((r >> 3) & 1) << 1) | (((r >> 1) & 3) << 3);
+}
+
+// Register-tiled variant of the dense kernel, for prefill.
+//
+// The column-per-thread kernel below couples decode reuse to one thread's registers: it
+// accumulates R rows in acc[R], so reusing a decode more means more registers in the SAME
+// thread. At R=64 that is 255 registers with spill, 2 blocks/SM, ~17% occupancy -- and it
+// is why prefill decodes at ~60 G/s while the batch-1 path manages ~372 G/s.
+//
+// Here the decoded weights go to SHARED memory instead, so every row group in the block
+// reuses them. Reuse becomes BM (rows per BLOCK) while registers stay TM*TN (the thread's
+// own output tile), which decouples the two:
+//
+//     BM * BN = (TM * TN) * NT
+//
+// BN is held at 128 on purpose: total activation traffic is rows * IC * (OC/BN), so
+// narrowing BN to buy reuse would multiply global reads instead (that mistake was caught
+// on paper, not in silicon -- BN=16 would have cost 8x the activation bandwidth).
+//
+// TN must be > 1. With one column per thread every shared read feeds exactly one MAC and
+// shared bandwidth becomes the new ceiling; a TMxTN tile does TM*TN MACs per TM+TN reads.
+template <int K, int BM, int BN, int TM, int TN>
+static __global__ void escha_matmul_dense_tiled(
+        const int16_t * __restrict__ code,
+        const half    * __restrict__ lut,
+        const int16_t * __restrict__ dep,
+        const float   * __restrict__ u,
+        float         * __restrict__ partial,
+        const int IC, const int OC, const int n_rows, const int n_slices) {
+    constexpr int NT  = (BM/TM)*(BN/TN);   // threads per block
+    constexpr int NTJ = BN/ESCHA_TILE;     // output tiles covered
+    constexpr int NCX = BN/TN;             // threads across the column axis
+
+    extern __shared__ char s_raw[];
+    uint32_t * s_pay = (uint32_t *) s_raw;                          // [NTJ][ESCHA_MAX_W]
+    float    * s_w   = (float *)(s_pay + NTJ*ESCHA_MAX_W);          // [16][BN]
+    float    * s_u   = s_w + ESCHA_TILE*BN;                         // [2][16][BM] transposed
+
+    GGML_UNUSED(lut);
+    GGML_UNUSED(dep);
+
+    const int NW = 8*K;
+    const int NB = 32*NW;
+
+    const int nit  = IC/ESCHA_TILE;
+    const int nct  = OC/ESCHA_TILE;
+    const int n_wd = (16*K)/2;
+
+    const int tid  = threadIdx.x;
+    const int cx   = tid % NCX;            // this thread's column strip
+    const int ry   = tid / NCX;            // this thread's row strip
+    const int row0 = blockIdx.x*BM;
+    const int oc0  = blockIdx.y*BN;
+
+    const int sl = blockIdx.z;
+    const int lo = (int) (((int64_t) nit*sl)/n_slices);
+    const int hi = (int) (((int64_t) nit*(sl + 1))/n_slices);
+
+    float acc[TM*TN];
+#pragma unroll
+    for (int i = 0; i < TM*TN; ++i) {
+        acc[i] = 0.0f;
+    }
+
+    // this thread's payload slot, fixed for the whole loop. One word per thread only:
+    static_assert(NTJ*((16*K)/2) <= NT, "escha: payload needs more than one word per thread");
+    const bool has_pay = tid < NTJ*n_wd;
+    const int  pt = tid/n_wd, pw = tid % n_wd;
+    uint32_t   ppre = 0;
+    if (has_pay && lo < hi) {
+        ppre = ((const uint32_t *)(code + (int64_t)(lo*nct + oc0/ESCHA_TILE + pt)*(16*K)))[pw];
+    }
+
+    // stage tile lo's activations into buffer 0 before the loop, so that inside the loop
+    // the fetch for ti+1 can be issued into the OTHER buffer and overlap this tile's work
+    if (lo < hi) {
+        for (int j = tid; j < BM*ESCHA_TILE; j += NT) {
+            const int m = j / ESCHA_TILE, r = j % ESCHA_TILE;
+            const int row = row0 + m;
+            s_u[r*BM + m] = row < n_rows ? u[(int64_t) row*IC + lo*ESCHA_TILE + r] : 0.0f;
+        }
+    }
+
+    for (int ti = lo; ti < hi; ++ti) {
+        float * su_cur = s_u + (((ti - lo) & 1)      )*(ESCHA_TILE*BM);
+        float * su_nxt = s_u + (((ti - lo) & 1) ^ 1  )*(ESCHA_TILE*BM);
+        // publish the payload fetched last round, then issue the next fetch before the
+        // barrier, so the global latency overlaps the decode instead of stalling every warp
+        if (has_pay) {
+            s_pay[pt*ESCHA_MAX_W + pw] = ppre;
+        }
+        if (has_pay && ti + 1 < hi) {
+            ppre = ((const uint32_t *)(code + (int64_t)((ti + 1)*nct + oc0/ESCHA_TILE + pt)*(16*K)))[pw];
+        }
+        __syncthreads();
+
+        // next tile's activations go to the other buffer: no barrier separates them from
+        // the reads of su_cur below, and the barrier at the top of the next iteration is
+        // what makes them visible
+        if (ti + 1 < hi) {
+            for (int j = tid; j < BM*ESCHA_TILE; j += NT) {
+                const int m = j / ESCHA_TILE, r = j % ESCHA_TILE;
+                const int row = row0 + m;
+                su_nxt[r*BM + m] = row < n_rows ? u[(int64_t) row*IC + (ti + 1)*ESCHA_TILE + r] : 0.0f;
+            }
+        }
+
+        // decode this input tile's 16 x BN weights once, for the whole block
+        for (int j = tid; j < ESCHA_TILE*BN; j += NT) {
+            const int r = j / BN, c = j % BN;
+            const uint32_t * pay = s_pay + (c/ESCHA_TILE)*ESCHA_MAX_W;
+            const int ccl = c % ESCHA_TILE;
+
+            int sp = ((32 - K) - K*(escha_dep_pi(r) + 32*ccl + 4*(ccl >> 3))) % NB;
+            if (sp < 0) {
+                sp += NB;
+            }
+            const int g0 = sp >> 5;
+            const int w0 = g0 ? (NW - g0) : 0;
+            const int w1 = w0 ? (w0 - 1)  : (NW - 1);
+
+            s_w[r*BN + c] = escha_codebook(__funnelshift_r(pay[w0], pay[w1], sp & 31) & 0xffffu);
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < ESCHA_TILE; ++r) {
+            float a[TM], b[TN];
+#pragma unroll
+            for (int m = 0; m < TM; ++m) {
+                a[m] = su_cur[r*BM + ry*TM + m];
+            }
+#pragma unroll
+            for (int n = 0; n < TN; ++n) {
+                b[n] = s_w[r*BN + cx*TN + n];
+            }
+#pragma unroll
+            for (int m = 0; m < TM; ++m) {
+#pragma unroll
+                for (int n = 0; n < TN; ++n) {
+                    acc[m*TN + n] += a[m]*b[n];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int m = 0; m < TM; ++m) {
+        const int row = row0 + ry*TM + m;
+        if (row < n_rows) {
+#pragma unroll
+            for (int n = 0; n < TN; ++n) {
+                partial[((int64_t) sl*n_rows + row)*OC + oc0 + cx*TN + n] = acc[m*TN + n];
+            }
+        }
+    }
+}
+
+
+// Prefill on tensor cores. Same decode as escha_matmul_dense_tiled, but the GEMM runs on
+// m16n8k16 HMMA with fp32 accumulate, which on GA102 is 71 TFLOPS against 35.6 for FP32 FMA.
+//
+// Two layout changes fall out of the fragment shapes, and both are cheap:
+//   s_u becomes [m][k] (was [k][m]) -- which makes staging a straight contiguous copy
+//   s_w becomes [n][k] (was [k][n]) -- B is the ".col" operand of mma.row.col
+//
+// The weights stay exact (escha_codebook_h). The ACTIVATIONS are rounded to fp16, which is
+// what escha's own runtime does, and costs rel_rms ~2.1e-4 against the fp32 reference.
+template <int K, int BM, int BN>
+static __global__ void __launch_bounds__(256, 1) escha_matmul_dense_tiled_mma(
+        const int16_t * __restrict__ code,
+        const half    * __restrict__ lut,
+        const int16_t * __restrict__ dep,
+        const float   * __restrict__ u,
+        float         * __restrict__ partial,
+        const int IC, const int OC, const int n_rows, const int n_slices) {
+#ifdef TURING_MMA_AVAILABLE
+    constexpr int NT   = 256;
+    constexpr int NW   = NT/32;          // warps
+    constexpr int WN   = 2;              // warps across the column axis
+    constexpr int WM   = NW/WN;          // warps down the row axis
+    constexpr int MT   = BM/16/WM;       // 16-row accumulator tiles per warp
+    constexpr int NTT  = BN/8/WN;        // 8-col accumulator tiles per warp
+    constexpr int NTJ  = BN/ESCHA_TILE;  // output tiles whose payload this block holds
+
+    extern __shared__ char s_raw[];
+    uint32_t * s_pay = (uint32_t *) s_raw;                            // [NTJ][ESCHA_MAX_W]
+    half     * s_u   = (half *)(s_pay + NTJ*ESCHA_MAX_W);             // [2][BM][16]
+    half     * s_w   = s_u + 2*BM*ESCHA_TILE;                         // [BN][16]
+
+    GGML_UNUSED(lut);
+    GGML_UNUSED(dep);
+
+    const int NWD = 8*K;
+    const int NB  = 32*NWD;
+
+    const int nit  = IC/ESCHA_TILE;
+    const int nct  = OC/ESCHA_TILE;
+    const int n_wd = (16*K)/2;
+
+    const int lane = threadIdx.x;          // must stay the lane: mma.cuh indexes on it
+    const int warp = threadIdx.y;
+    const int tid  = warp*32 + lane;        // flat id, for the layout-agnostic staging loops
+    const int row0 = blockIdx.x*BM;
+    const int oc0  = blockIdx.y*BN;
+
+    const int sl = blockIdx.z;
+    const int lo = (int) (((int64_t) nit*sl)/n_slices);
+    const int hi = (int) (((int64_t) nit*(sl + 1))/n_slices);
+
+    const int wm   = warp / WN;
+    const int wn   = warp % WN;
+
+    constexpr int DPT = (ESCHA_TILE*BN)/NT;   // weights this thread decodes per tile
+    static_assert(NT % ESCHA_TILE == 0,        "escha: r would not be thread-invariant");
+    static_assert((ESCHA_TILE*BN) % NT == 0,   "escha: ragged decode assignment");
+    static_assert(NT/ESCHA_TILE <= ESCHA_TILE, "escha: ccl would not be thread-invariant");
+
+    constexpr int APT = (BM*ESCHA_TILE)/NT;    // activations this thread stages per tile
+    static_assert((BM*ESCHA_TILE) % NT == 0,   "escha: ragged activation assignment");
+    static_assert(NT/ESCHA_TILE <= BM,         "escha: activation rows would alias");
+    const int am = tid / ESCHA_TILE;           // base row within the block
+    const int ar = tid % ESCHA_TILE;           // this thread's r, fixed
+
+    const int dr   = tid % ESCHA_TILE;         // this thread's r, every k, every tile
+    const int dccl = tid / ESCHA_TILE;         // and its column within the 16-wide tile
+    int dsp = ((32 - K) - K*(escha_dep_pi(dr) + 32*dccl + 4*(dccl >> 3))) % NB;
+    if (dsp < 0) {
+        dsp += NB;
+    }
+    const int dg0 = dsp >> 5;
+    const int dw0 = dg0 ? (NWD - dg0) : 0;
+    const int dw1 = dw0 ? (dw0 - 1)   : (NWD - 1);
+    const int dsh = dsp & 31;
+
+    typedef ggml_cuda_mma::tile<16, 8, float> tile_c;
+    typedef ggml_cuda_mma::tile<16, 8, half2> tile_a;
+    typedef ggml_cuda_mma::tile<8,  8, half2> tile_b;
+
+    tile_c acc[MT][NTT];
+
+    // one payload word per thread, held a tile ahead
+    static_assert(NTJ*((16*K)/2) <= NT, "escha: payload needs more than one word per thread");
+    const bool has_pay = tid < NTJ*n_wd;
+    const int  pt = tid/n_wd, pw = tid % n_wd;
+    uint32_t   ppre = 0;
+    if (has_pay && lo < hi) {
+        ppre = ((const uint32_t *)(code + (int64_t)(lo*nct + oc0/ESCHA_TILE + pt)*(16*K)))[pw];
+    }
+
+    // activations for tile lo into buffer 0
+    if (lo < hi) {
+        const int64_t rstride = (int64_t) ESCHA_TILE*IC;
+        const float * up = u + (int64_t)(row0 + am)*IC + lo*ESCHA_TILE + ar;
+#pragma unroll
+        for (int k = 0; k < APT; ++k) {
+            const int m   = am + ESCHA_TILE*k;
+            const int row = row0 + m;
+            s_u[m*ESCHA_TILE + ar] = row < n_rows ? __float2half(*up) : __float2half(0.0f);
+            up += rstride;
+        }
+    }
+
+    for (int ti = lo; ti < hi; ++ti) {
+        half * su_cur = s_u + (((ti - lo) & 1)     )*(BM*ESCHA_TILE);
+        half * su_nxt = s_u + (((ti - lo) & 1) ^ 1 )*(BM*ESCHA_TILE);
+
+        if (has_pay) {
+            s_pay[pt*ESCHA_MAX_W + pw] = ppre;
+        }
+        if (has_pay && ti + 1 < hi) {
+            ppre = ((const uint32_t *)(code + (int64_t)((ti + 1)*nct + oc0/ESCHA_TILE + pt)*(16*K)))[pw];
+        }
+        __syncthreads();
+
+        if (ti + 1 < hi) {
+            const int64_t rstride = (int64_t) ESCHA_TILE*IC;
+            const float * up = u + (int64_t)(row0 + am)*IC + (ti + 1)*ESCHA_TILE + ar;
+#pragma unroll
+            for (int k = 0; k < APT; ++k) {
+                const int m   = am + ESCHA_TILE*k;
+                const int row = row0 + m;
+                su_nxt[m*ESCHA_TILE + ar] = row < n_rows ? __float2half(*up) : __float2half(0.0f);
+                up += rstride;
+            }
+        }
+
+        // decode into [n][k]. All the addressing is precomputed above; iteration k reads
+        // payload tile k and writes column dccl + 16k, so this is just load, shift, codebook.
+#pragma unroll
+        for (int k = 0; k < DPT; ++k) {
+            const uint32_t * pay = s_pay + k*ESCHA_MAX_W;
+            const int c = dccl + ESCHA_TILE*k;
+            s_w[c*ESCHA_TILE + dr] =
+                escha_codebook_h(__funnelshift_r(pay[dw0], pay[dw1], dsh) & 0xffffu);
+        }
+        __syncthreads();
+
+        {
+            const half2 * su2 = (const half2 *) su_cur;   // [BM][8] half2
+            const half2 * sw2 = (const half2 *) s_w;      // [BN][8] half2
+
+            tile_a A[MT];
+            tile_b B[NTT];
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                ggml_cuda_mma::load_ldmatrix(A[i], su2 + (size_t)(wm*(16*MT) + i*16)*8, 8);
+            }
+#pragma unroll
+            for (int j = 0; j < NTT; ++j) {
+                ggml_cuda_mma::load_ldmatrix(B[j], sw2 + (size_t)(wn*(8*NTT) + j*8)*8, 8);
+            }
+#pragma unroll
+            for (int i = 0; i < MT; ++i) {
+#pragma unroll
+                for (int j = 0; j < NTT; ++j) {
+                    ggml_cuda_mma::mma(acc[i][j], A[i], B[j]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < MT; ++i) {
+#pragma unroll
+        for (int j = 0; j < NTT; ++j) {
+#pragma unroll
+            for (int l = 0; l < tile_c::ne; ++l) {
+                const int m   = wm*(16*MT) + i*16 + tile_c::get_i(l);
+                const int n   = wn*(8*NTT) + j*8  + tile_c::get_j(l);
+                const int row = row0 + m;
+                if (row < n_rows) {
+                    partial[((int64_t) sl*n_rows + row)*OC + oc0 + n] = acc[i][j].x[l];
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(code, lut, dep, u, partial, IC, OC, n_rows, n_slices);
+    NO_DEVICE_CODE;
+#endif // TURING_MMA_AVAILABLE
+}
+
+// partial[slice][row][c] = sum over this slice's input tiles of u . decode(code)
+template <int K, int R>
+static __global__ void escha_matmul_dense(
+        const int16_t * __restrict__ code,
+        const half    * __restrict__ lut,
+        const int16_t * __restrict__ dep,
+        const float   * __restrict__ u,
+        float         * __restrict__ partial,
+        const int IC, const int OC, const int n_rows, const int n_slices) {
+    extern __shared__ char s_raw[];
+
+    // every decode wants the adjacent pair (pay[w0-1], pay[w0]), so hold the payload AS
+    // overlapping pairs: one aligned LDS.64 then replaces the two LDS the funnel shift needed
+    uint2 * s_pay = (uint2 *) s_raw;                                   // [ESCHA_GROUPS][ESCHA_MAX_W]
+    float * s_u   = (float *)(s_pay + ESCHA_GROUPS*ESCHA_MAX_W);       // [R][16]
+
+    GGML_UNUSED(lut);
+    GGML_UNUSED(dep);
+
+    const int NW = 8*K;          // 32-bit words in a tile payload
+    const int NB = 32*NW;        // bits
+
+    const int nit  = IC/ESCHA_TILE;
+    const int nct  = OC/ESCHA_TILE;
+    const int n_wd = (16*K)/2;
+
+    const int tid   = threadIdx.x;
+    const int start = blockIdx.x*R;
+    const int nrow  = min(R, n_rows - start);
+
+    // this block's share of the input tiles
+    const int sl  = blockIdx.z;
+    const int lo  = (int) (((int64_t) nit*sl)/n_slices);
+    const int hi  = (int) (((int64_t) nit*(sl + 1))/n_slices);
+
+    const int grp = tid / ESCHA_TILE;
+    const int cc  = tid % ESCHA_TILE;
+    const int tj  = blockIdx.y*ESCHA_GROUPS + grp;
+
+    uint2 * pay = s_pay + grp*ESCHA_MAX_W;
+
+    // start position for this thread's column, before the per-row term
+    int s0 = ((32 - K) - K*(32*cc + 4*(cc >> 3))) % NB;
+    if (s0 < 0) {
+        s0 += NB;
+    }
+
+    float acc[R];
+#pragma unroll
+    for (int m = 0; m < R; ++m) {
+        acc[m] = 0.0f;
+    }
+    // At R == 1 the block reads one row, so its entire slice of u fits in shared and is
+    // staged once here -- the per-tile staging below then disappears, and with it the
+    // block-wide barrier that ordered it. This is what their 10,240-byte allocation is.
+    if constexpr (R == 1) {
+        const float * u_row = u + (int64_t) start*IC + (int64_t) lo*ESCHA_TILE;
+        const int n_stage = (hi - lo)*ESCHA_TILE;
+        for (int j = tid; j < n_stage; j += ESCHA_NT) {
+            s_u[j] = u_row[j];
+        }
+    }
+    // payload words this thread owns, and the tile fetched one iteration ahead
+    constexpr int NPW = (8*K + ESCHA_TILE - 1)/ESCHA_TILE;
+    uint32_t pre[NPW];
+    if (lo < hi) {
+        const uint32_t * s0p = (const uint32_t *)(code + (int64_t)(lo*nct + tj)*(16*K));
+#pragma unroll
+        for (int i = 0; i < NPW; ++i) {
+            const int wd = cc + i*ESCHA_TILE;
+            if (wd < n_wd) {
+                pre[i] = s0p[wd];
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int ti = lo; ti < hi; ++ti) {
+        // as in the routed kernel: the block cooperates on one 16-wide slice of u per row,
+        // and the 16 threads of a group then read the same entry, so it broadcasts
+        if constexpr (R != 1) {
+            for (int j = tid; j < R*ESCHA_TILE; j += ESCHA_NT) {
+                const int m = j / ESCHA_TILE;
+                const int r = j % ESCHA_TILE;
+                s_u[j] = m < nrow ? u[(int64_t)(start + m)*IC + ti*ESCHA_TILE + r] : 0.0f;
+            }
+        }
+
+        // publish the tile fetched last round, then issue the next fetch immediately: the
+        // LDG then overlaps this tile's decode instead of stalling in front of it, which is
+        // what the LDG -> dependent STS pair at the top of the loop was costing
+#pragma unroll
+        for (int i = 0; i < NPW; ++i) {
+            const int wd = cc + i*ESCHA_TILE;
+            if (wd < n_wd) {
+                // word wd is the high half of pair wd and the low half of pair wd+1
+                pay[wd].y = pre[i];
+                pay[wd + 1 == NW ? 0 : wd + 1].x = pre[i];
+            }
+        }
+        if (ti + 1 < hi) {
+            const uint32_t * nxt = (const uint32_t *)(code + (int64_t)((ti + 1)*nct + tj)*(16*K));
+#pragma unroll
+            for (int i = 0; i < NPW; ++i) {
+                const int wd = cc + i*ESCHA_TILE;
+                if (wd < n_wd) {
+                    pre[i] = nxt[wd];
+                }
+            }
+        }
+        if constexpr (R == 1) { __syncwarp(); } else { __syncthreads(); }
+
+        const float * uu = s_u + (ti - lo)*ESCHA_TILE;
+
+        // generation unrolls fully so pi(r) folds to a compile-time constant; prefill keeps
+        // a partial unroll, where acc[R] already claims the registers
+#pragma unroll (R <= 8 ? 16 : 4)
+        for (int r = 0; r < ESCHA_TILE; ++r) {
+            // K*pi(r) <= 81 < NB, so one conditional add restores the range
+            int sp = s0 - K*escha_dep_pi(r);
+            if (sp < 0) {
+                sp += NB;
+            }
+
+            const int g0 = sp >> 5;
+            const int w0 = g0 ? (NW - g0) : 0;
+            const int w1 = w0 ? (w0 - 1)  : (NW - 1);
+
+            const uint2 p = pay[w0];
+            GGML_UNUSED(w1);
+            const uint32_t idx = __funnelshift_r(p.y, p.x, sp & 31) & 0xffffu;
+
+            const float wv = escha_codebook(idx);
+            if constexpr (R == 1) {
+                acc[0] += uu[r]*wv;
+            } else {
+#pragma unroll
+                for (int m = 0; m < R; ++m) {
+                    acc[m] += s_u[m*ESCHA_TILE + r]*wv;
+                }
+            }
+        }
+        if constexpr (R == 1) { __syncwarp(); } else { __syncthreads(); }
+    }
+
+    for (int m = 0; m < nrow; ++m) {
+        partial[((int64_t) sl*n_rows + start + m)*OC + blockIdx.y*ESCHA_NT + tid] = acc[m];
+    }
+}
+
+// sum the slices in a fixed order (so the result is reproducible), rotate the
+// 128-column group, scale by rout
+static __global__ void escha_finalize_dense(
+        const half  * __restrict__ rout,
+        const float * __restrict__ partial,
+        float       * __restrict__ dst,
+        const int OC, const int ne1, const int n_rows, const int n_slices,
+        const int64_t nb_d1, const int64_t nb_d2) {
+    __shared__ float s_acc[ESCHA_NT];
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const int c   = blockIdx.y*ESCHA_NT + tid;
+
+    float sum = 0.0f;
+    for (int s = 0; s < n_slices; ++s) {
+        sum += partial[((int64_t) s*n_rows + row)*OC + c];
+    }
+    s_acc[tid] = sum;
+    __syncthreads();
+
+    escha_hadamard_128(s_acc, ESCHA_NT, tid, ESCHA_NT);
+
+    float * dst_row = (float *)((char *) dst + (int64_t)(row % ne1)*nb_d1
+                                             + (int64_t)(row / ne1)*nb_d2);
+    dst_row[c] = s_acc[tid]*__half2float(rout[c]);
+}
+
+void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * code = dst->src[0];
+    const ggml_tensor * rin  = dst->src[1];
+    const ggml_tensor * rout = dst->src[2];
+    const ggml_tensor * lut  = dst->src[3];
+    const ggml_tensor * dep  = dst->src[4];
+    const ggml_tensor * x    = dst->src[5];
+
+    GGML_ASSERT(code->type == GGML_TYPE_I16 && dep->type == GGML_TYPE_I16);
+    GGML_ASSERT(rin->type == GGML_TYPE_F16 && rout->type == GGML_TYPE_F16 && lut->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int K   = code->ne[0]/16;
+    const int OC  = code->ne[1]*16;
+    const int IC  = code->ne[2]*16;
+    const int nit = IC/ESCHA_TILE;
+
+    const int n_rows = x->ne[1]*x->ne[2];
+    const int n_ocb  = OC/ESCHA_NT;
+
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<float> u_buf(ctx.pool(), (size_t) n_rows*IC);
+
+    escha_rotate_in_dense<<<n_rows, 256, 0, stream>>>(
+        (const half *) rin->data, (const float *) x->data, u_buf.get(),
+        IC, (int) x->ne[1], x->nb[1], x->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
+
+    // slice the IC reduction only as far as it takes to fill the device: at batch 1 the
+    // natural grid is just n_ocb blocks, but a long prompt already has plenty of rows
+    const bool gen = n_rows <= ESCHA_GEN_MAX_ROWS;
+    const int  R   = gen ? ESCHA_ROWS_DENSE_GEN : ESCHA_ROWS_DENSE;
+
+    const int n_rb = (n_rows + R - 1)/R;
+    // the tiled prefill kernel blocks over BM rows x BN columns instead
+    const int n_tb = (n_rows + ESCHA_BM - 1)/ESCHA_BM;
+    const int n_cb = OC/ESCHA_BN;
+    // batch 1 has only n_ocb blocks before slicing (136 for the FFN), which leaves an 82-SM
+    // device mostly idle, so generation slices the reduction much harder than prefill
+    const int target = gen ? ESCHA_GEN_TARGET_MUL*ESCHA_TARGET : ESCHA_TARGET;
+    int n_slices = target/MAX(1, gen ? n_rb*n_ocb : n_tb*n_cb);
+    n_slices = MIN(MAX(n_slices, 1), nit);
+
+    ggml_cuda_pool_alloc<float> p_buf(ctx.pool(), (size_t) n_slices*n_rows*OC);
+
+    if (gen) {
+        // widest slice any block gets, since lo/hi split nit unevenly by at most one tile
+        const int tiles_max = (nit + n_slices - 1)/n_slices;
+        const size_t smem = ESCHA_GROUPS*ESCHA_MAX_W*sizeof(uint2)
+                          + (size_t) tiles_max*ESCHA_TILE*sizeof(float);
+        GGML_ASSERT(smem <= 48*1024 && "escha: staged u exceeds the default shared budget");
+        auto launch = [&](auto kernel) {
+            kernel<<<dim3(n_rb, n_ocb, n_slices), ESCHA_NT, smem, stream>>>(
+                (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
+                u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+        };
+        switch (K) {
+            case 2: launch(escha_matmul_dense<2, ESCHA_ROWS_DENSE_GEN>); break;
+            case 3: launch(escha_matmul_dense<3, ESCHA_ROWS_DENSE_GEN>); break;
+            default: GGML_ABORT("escha: unsupported K=%d", K);
+        }
+    } else if (OC % ESCHA_BN != 0) {
+        // the tiled kernel blocks the output axis in exact BN steps; a ragged OC would
+        // silently leave the tail columns unwritten. Every projection in this checkpoint is
+        // 128-aligned, but that is a property of the model, not of the format.
+        const size_t smem = ESCHA_GROUPS*ESCHA_MAX_W*sizeof(uint2)
+                          + (size_t) ESCHA_ROWS_DENSE*ESCHA_TILE*sizeof(float);
+        auto launch = [&](auto kernel) {
+            kernel<<<dim3((n_rows + ESCHA_ROWS_DENSE - 1)/ESCHA_ROWS_DENSE, n_ocb, n_slices),
+                     ESCHA_NT, smem, stream>>>(
+                (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
+                u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+        };
+        switch (K) {
+            case 2: launch(escha_matmul_dense<2, ESCHA_ROWS_DENSE>); break;
+            case 3: launch(escha_matmul_dense<3, ESCHA_ROWS_DENSE>); break;
+            default: GGML_ABORT("escha: unsupported K=%d", K);
+        }
+    } else if (ggml_cuda_info().devices[ctx.device].cc >= GGML_CUDA_CC_TURING
+               && getenv("ESCHA_NO_MMA") == nullptr) {
+        // tensor-core prefill. Weights are exact; activations are rounded to fp16, which is
+        // what escha's runtime does. ESCHA_NO_MMA=1 falls back to the fp32 FMA kernel.
+        constexpr int NTJ = ESCHA_BN/ESCHA_TILE;
+        const size_t smem = NTJ*ESCHA_MAX_W*sizeof(uint32_t)
+                          + (size_t) 2*ESCHA_BM*ESCHA_TILE*sizeof(half)
+                          + (size_t) ESCHA_BN*ESCHA_TILE*sizeof(half);
+        auto launch = [&](auto kernel) {
+            kernel<<<dim3(n_tb, n_cb, n_slices), dim3(32, 256/32), smem, stream>>>(
+                (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
+                u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+        };
+        switch (K) {
+            case 2: launch((escha_matmul_dense_tiled_mma<2, ESCHA_BM, ESCHA_BN>)); break;
+            case 3: launch((escha_matmul_dense_tiled_mma<3, ESCHA_BM, ESCHA_BN>)); break;
+            default: GGML_ABORT("escha: unsupported K=%d", K);
+        }
+    } else {
+        constexpr int NT  = (ESCHA_BM/ESCHA_TM)*(ESCHA_BN/ESCHA_TN);
+        constexpr int NTJ = ESCHA_BN/ESCHA_TILE;
+        const size_t smem = NTJ*ESCHA_MAX_W*sizeof(uint32_t)
+                          + (size_t) ESCHA_TILE*ESCHA_BN*sizeof(float)
+                          + (size_t) 2*ESCHA_TILE*ESCHA_BM*sizeof(float);
+        auto launch = [&](auto kernel) {
+            kernel<<<dim3(n_tb, n_cb, n_slices), NT, smem, stream>>>(
+                (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
+                u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
+        };
+        switch (K) {
+            case 2: launch((escha_matmul_dense_tiled<2, ESCHA_BM, ESCHA_BN, ESCHA_TM, ESCHA_TN>)); break;
+            case 3: launch((escha_matmul_dense_tiled<3, ESCHA_BM, ESCHA_BN, ESCHA_TM, ESCHA_TN>)); break;
+            default: GGML_ABORT("escha: unsupported K=%d", K);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    escha_finalize_dense<<<dim3(n_rows, n_ocb), ESCHA_NT, 0, stream>>>(
+        (const half *) rout->data, p_buf.get(), (float *) dst->data,
+        OC, (int) x->ne[1], n_rows, n_slices, dst->nb[1], dst->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
 }

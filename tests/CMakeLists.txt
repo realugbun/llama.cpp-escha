@@ -336,6 +336,7 @@ endif()
 
 # needs a case file generated from the escha checkpoint, so build only
 llama_build(test-escha-moe.cpp)
+llama_build(test-escha-mul-mat.cpp)
 
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
