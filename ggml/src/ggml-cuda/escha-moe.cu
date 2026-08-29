@@ -48,6 +48,24 @@
 #define ESCHA_ROWS_DENSE_GEN   1
 #define ESCHA_GEN_MAX_ROWS    16   // at or below this, use the generation instantiation
 #define ESCHA_GEN_TARGET_MUL   4
+// ...but "generation" was only ever one row per block, so a 2-16 row batch decoded the
+// whole weight payload once PER ROW. The decode is ~12x more expensive than the global
+// traffic it feeds (batch 1 runs at ~1/12 of this card's bandwidth), so that made the
+// window that speculative decoding lands in scale linearly with rows: batch 16 was 1.31x
+// batch 1 where a healthy kernel gets 6.8x.
+// The R != 1 body of escha_matmul_dense already holds acc[R] live across one decoded
+// weight, so all this needs is a row tile that actually covers the batch. R is rounded up
+// to a power of two so it stays a template constant, and capped at ESCHA_GEN_MAX_ROWS
+// (acc[R] is per thread; R=64 was measured at 1.84 t/s for exactly that reason).
+// R == 1 keeps the old whole-slice u staging and the old grid, bit for bit, so
+// single-row generation is untouched.
+static inline int escha_gen_rows(int n_rows) {
+    int r = 1;
+    while (r < n_rows && r < ESCHA_GEN_MAX_ROWS) {
+        r *= 2;
+    }
+    return r;
+}
 // prefill tile for the register-tiled kernel. BM*BN = TM*TN*NT, so these four fix the
 // thread count too: NT = (BM/TM)*(BN/TN). BN stays 128 -- activation traffic is
 // rows*IC*(OC/BN), so a narrower BN buys reuse with global bandwidth, which is a losing trade.
@@ -1037,7 +1055,7 @@ static __global__ void escha_matmul_dense(
 
         // generation unrolls fully so pi(r) folds to a compile-time constant; prefill keeps
         // a partial unroll, where acc[R] already claims the registers
-#pragma unroll (R <= 8 ? 16 : 4)
+#pragma unroll (R <= 16 ? 16 : 4)
         for (int r = 0; r < ESCHA_TILE; ++r) {
             // K*pi(r) <= 81 < NB, so one conditional add restores the range
             int sp = s0 - K*escha_dep_pi(r);
@@ -1145,7 +1163,7 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     // slice the IC reduction only as far as it takes to fill the device: at batch 1 the
     // natural grid is just n_ocb blocks, but a long prompt already has plenty of rows
-    const int  R   = gen ? ESCHA_ROWS_DENSE_GEN : ESCHA_ROWS_DENSE;
+    const int  R   = gen ? escha_gen_rows(n_rows) : ESCHA_ROWS_DENSE;
 
     const int n_rb = (n_rows + R - 1)/R;
     // the tiled prefill kernel blocks over BM rows x BN columns instead
@@ -1154,7 +1172,14 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // batch 1 has only n_ocb blocks before slicing (136 for the FFN), which leaves an 82-SM
     // device mostly idle, so generation slices the reduction much harder than prefill
     const int target = gen ? ESCHA_GEN_TARGET_MUL*ESCHA_TARGET : ESCHA_TARGET;
-    int n_slices = target/MAX(1, gen ? n_rb*n_ocb : n_tb*n_cb);
+    // NOTE: the gen slice count is deliberately derived from n_rows, NOT from n_rb.
+    // The slice boundaries decide how the fp32 partials are grouped before
+    // escha_finalize_dense adds them, so they are part of the ARITHMETIC, not just the
+    // launch shape. Deriving them from n_rb (which the row tile drops to 1) would regroup
+    // the sum and change the result bit for bit. Keeping the original expression makes a
+    // row tile of R produce exactly what R separate one-row blocks produced -- the decode
+    // is shared, the arithmetic is untouched.
+    int n_slices = target/MAX(1, gen ? n_rows*n_ocb : n_tb*n_cb);
     n_slices = MIN(MAX(n_slices, 1), nit);
 
     ggml_cuda_pool_alloc<float> p_buf(ctx.pool(), (size_t) n_slices*n_rows*OC);
@@ -1162,19 +1187,30 @@ void ggml_cuda_op_escha_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * d
     if (gen) {
         // widest slice any block gets, since lo/hi split nit unevenly by at most one tile
         const int tiles_max = (nit + n_slices - 1)/n_slices;
+        // R == 1 stages its entire slice of u once; R > 1 stages one [R][16] tile per step
         const size_t smem = ESCHA_GROUPS*ESCHA_MAX_W*sizeof(uint2)
-                          + (size_t) tiles_max*ESCHA_TILE*sizeof(float);
+                          + (size_t)(R == 1 ? tiles_max : R)*ESCHA_TILE*sizeof(float);
         GGML_ASSERT(smem <= 48*1024 && "escha: staged u exceeds the default shared budget");
         auto launch = [&](auto kernel) {
             kernel<<<dim3(n_rb, n_ocb, n_slices), ESCHA_NT, smem, stream>>>(
                 (const int16_t *) code->data, (const half *) lut->data, (const int16_t *) dep->data,
                 (const float *) u_buf.get(), p_buf.get(), IC, OC, n_rows, n_slices);
         };
+#define ESCHA_GEN_LAUNCH(KK)                                                  \
+        switch (R) {                                                          \
+            case  1: launch(escha_matmul_dense<KK,  1>); break;               \
+            case  2: launch(escha_matmul_dense<KK,  2>); break;               \
+            case  4: launch(escha_matmul_dense<KK,  4>); break;               \
+            case  8: launch(escha_matmul_dense<KK,  8>); break;               \
+            case 16: launch(escha_matmul_dense<KK, 16>); break;               \
+            default: GGML_ABORT("escha: unsupported gen R=%d", R);            \
+        }
         switch (K) {
-            case 2: launch(escha_matmul_dense<2, ESCHA_ROWS_DENSE_GEN>); break;
-            case 3: launch(escha_matmul_dense<3, ESCHA_ROWS_DENSE_GEN>); break;
+            case 2: ESCHA_GEN_LAUNCH(2); break;
+            case 3: ESCHA_GEN_LAUNCH(3); break;
             default: GGML_ABORT("escha: unsupported K=%d", K);
         }
+#undef ESCHA_GEN_LAUNCH
     } else if (OC % ESCHA_BN != 0) {
         // the tiled kernel blocks the output axis in exact BN steps; a ragged OC would
         // silently leave the tail columns unwritten. Every projection in this checkpoint is
